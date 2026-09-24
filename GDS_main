@@ -1,0 +1,442 @@
+import argparse
+import os
+import json
+import time
+from typing import Any, Dict, List, Tuple
+import torch
+import numpy as np
+from datasets import load_dataset, Dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    logging,
+    set_seed,
+    get_scheduler,
+    DataCollatorForLanguageModeling,
+)
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+
+WIKIMIA_DATASET_PATH = "wiki_mia_dataset_path"
+ARXIV_DATASET_PATH = "arxiv_tection_dataset_path"
+MODEL_PATH = "llama_model_path"
+CHECKPOINTS_DIR = "checkpoints_dir"
+GRADIENT_MONITOR_DIRNAME = "gradient_monitor_dir"
+FINAL_GRADIENT_REPORT_FILENAME = "final_gradient_report.json"
+ALL_EPOCHS_GRAD_STATS_FILENAME = "all_epochs_grad_stats.json"
+
+
+class LoRAGradientMonitor:
+
+    def __init__(self, model, model_name: str, log_dir: str):
+        self.raw_model = model
+        self.model_name = model_name
+        self.log_dir = log_dir
+        self.epoch_grad_stats = {}
+        self.current_epoch = 0
+        self.update_stats_history = []
+        self.epoch_start_params = {}
+        self.training_start_time = None
+        self.sample_info = {}
+        self.training_config = {}
+
+    def set_sample_info(self, sample_index: int, sample_text: str, sample_label: int, total_samples: int):
+        self.sample_info = {
+            "sample_index": sample_index,
+            "sample_text": sample_text,
+            "sample_label": sample_label,
+            "total_samples": total_samples
+        }
+
+    def set_training_config(self, lr: float, epochs: int):
+        self.training_config = {
+            "model_name": self.model_name,
+            "train_mode": "lora",
+            "epochs": epochs,
+            "learning_rate": lr,
+            "training_time_seconds": 0.0
+        }
+
+    def reset_epoch_stats(self):
+        self.epoch_grad_stats = {
+            "epoch": self.current_epoch,
+            "layer_updates": {}
+        }
+        self.epoch_start_params = {}
+
+    def save_epoch_start_params(self):
+        self.epoch_start_params = {}
+        for name, param in self.raw_model.named_parameters():
+            if param.requires_grad and "lora" in name:
+                self.epoch_start_params[name] = param.data.clone().detach()
+
+    def start_training_timer(self):
+        self.training_start_time = time.time()
+
+    def _calculate_single_param_stats(self, param_name: str, param: torch.nn.Parameter) -> Dict[str, Any]:
+        if param.grad is not None and param.grad.numel() > 0:
+            grad = param.grad
+        else:
+            if param_name not in self.epoch_start_params:
+                return {}
+            grad = param.data - self.epoch_start_params[param_name]
+
+        if grad is None or grad.numel() == 0:
+            return {}
+
+        grad_abs = grad.abs()
+        total_elem = grad_abs.numel()
+        top_k = max(1, int(0.1 * total_elem))
+        top_vals, top_flat_idx = torch.topk(grad_abs.view(-1), top_k)
+
+        stats = {
+            "param_name": param_name,
+            "submodule_name": "weight",
+            "grad_mean": grad.mean().item(),
+            "grad_abs_mean": grad_abs.mean().item(),
+            "grad_std": grad.std().item(),
+            "grad_max": grad.max().item(),
+            "grad_min": grad.min().item(),
+            "grad_l1": grad.norm(p=1).item(),
+            "grad_l2": grad.norm(p=2).item(),
+            "grad_top10p_ratio": top_vals.sum().item() / (grad.norm(p=1).item() + 1e-8),
+        }
+
+        if len(grad.shape) >= 2:
+            row_mean = grad.mean(dim=1)
+            stats.update({
+                "grad_row_mean_max": row_mean.max().item(),
+                "grad_row_mean_std": row_mean.std().item(),
+                "grad_sparsity": (grad_abs < 1e-6).float().mean().item(),
+            })
+
+            top_row_idx = top_flat_idx // grad_abs.shape[1]
+            top_col_idx = top_flat_idx % grad_abs.shape[1]
+
+            row_center = grad_abs.shape[0] / 2
+            col_center = grad_abs.shape[1] / 2
+            stats.update({
+                "grad_top10_row_std": top_row_idx.float().std().item(),
+                "grad_top10_row_eccentricity": torch.mean(
+                    torch.abs(top_row_idx.float() - row_center)
+                ).item() / (row_center + 1e-8),
+                "grad_top10_col_eccentricity": torch.mean(
+                    torch.abs(top_col_idx.float() - col_center)
+                ).item() / (col_center + 1e-8),
+            })
+        else:
+            stats.update({
+                "grad_row_mean_max": 0.0,
+                "grad_row_mean_std": 0.0,
+                "grad_sparsity": 1.0 if grad_abs.sum().item() == 0 else 0.0,
+                "grad_top10_row_std": 0.0,
+                "grad_top10_row_eccentricity": 0.0,
+                "grad_top10_col_eccentricity": 0.0,
+            })
+
+        return stats
+
+    def _parse_module_type(self, param_name: str) -> Tuple[int, str, str]:
+        layer_num = -1
+        module_type = "other"
+        submodule_group = "other"
+
+        if "layers." in param_name:
+            layer_part = param_name.split("layers.")[1]
+            if "." in layer_part:
+                try:
+                    layer_num = int(layer_part.split(".")[0])
+                except:
+                    pass
+        elif "h." in param_name:
+            layer_part = param_name.split("h.")[1]
+            if "." in layer_part:
+                try:
+                    layer_num = int(layer_part.split(".")[0])
+                except:
+                    pass
+
+        if any(k in param_name for k in ['self_attn', 'attn', 'q_proj', 'k_proj', 'v_proj', 'o_proj']):
+            module_type = "attention"
+        elif any(k in param_name for k in ['mlp', 'ffn', 'up_proj', 'down_proj', 'gate_proj']):
+            module_type = "ffn"
+
+        return layer_num, module_type, submodule_group
+
+    def collect_epoch_stats(self):
+        param_stats = {}
+
+        for name, param in self.raw_model.named_parameters():
+            if param.requires_grad and "lora" in name:
+                layer_num, module_type, _ = self._parse_module_type(name)
+                if layer_num == -1:
+                    continue
+
+                if layer_num not in param_stats:
+                    param_stats[layer_num] = {}
+                if module_type not in param_stats[layer_num]:
+                    param_stats[layer_num][module_type] = {
+                        "submodule_details": [],
+                        "param_count": 0,
+                        "avg_update": 0.0,
+                        "avg_update_abs": 0.0
+                    }
+
+                single_stats = self._calculate_single_param_stats(name, param)
+                if single_stats:
+                    param_stats[layer_num][module_type]["submodule_details"].append(single_stats)
+                    param_stats[layer_num][module_type]["param_count"] += 1
+
+        for layer_num in param_stats:
+            for module_type in param_stats[layer_num]:
+                details = param_stats[layer_num][module_type]["submodule_details"]
+                if not details:
+                    continue
+
+                avg_update = np.mean([d["grad_mean"] for d in details])
+                avg_update_abs = np.mean([d["grad_abs_mean"] for d in details])
+
+                param_stats[layer_num][module_type]["avg_update"] = avg_update
+                param_stats[layer_num][module_type]["avg_update_abs"] = avg_update_abs
+
+        self.epoch_grad_stats["layer_updates"] = param_stats
+
+    def end_epoch(self, epoch_num: int) -> Dict[str, Any]:
+        self.current_epoch = epoch_num
+        self.collect_epoch_stats()
+        self.update_stats_history.append(self.epoch_grad_stats)
+        self.reset_epoch_stats()
+        return self.epoch_grad_stats
+
+    def get_final_report(self) -> Dict[str, Any]:
+        training_time = time.time() - self.training_start_time if self.training_start_time else 0.0
+        self.training_config["training_time_seconds"] = round(training_time, 6)
+
+        final_report = {
+            "metadata": {
+                "sample_info": self.sample_info,
+                "training_info": self.training_config
+            },
+            "gradient_update_history": self.update_stats_history
+        }
+
+        os.makedirs(self.log_dir, exist_ok=True)
+        report_path = os.path.join(self.log_dir, FINAL_GRADIENT_REPORT_FILENAME)
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(final_report, f, indent=4, ensure_ascii=False)
+
+        return final_report
+
+
+def get_dataset(args: Any) -> Dataset:
+    format_dataset = {"text": [], "label": []}
+
+    if args.dataset_name == "WikiMIA":
+        length = [32, 64, 128, 256]
+        for l in length:
+            dataset = load_dataset(WIKIMIA_DATASET_PATH, split=f"WikiMIA_length{l}")
+            dataset = dataset.shuffle(seed=args.seed)
+
+            if args.train_size < 1:
+                split = dataset.train_test_split(
+                    train_size=args.train_size, seed=args.seed
+                )
+                dataset = split["train"]
+
+            for item in dataset:
+                format_dataset["text"].append(item["input"])
+                format_dataset["label"].append(item["label"])
+
+    elif args.dataset_name == "arXivTection":
+        dataset_raw = load_dataset(ARXIV_DATASET_PATH)
+        dataset = dataset_raw['train']
+
+        dataset = dataset.shuffle(seed=args.seed)
+
+        if args.train_size < 1:
+            split = dataset.train_test_split(
+                train_size=args.train_size, seed=args.seed
+            )
+            dataset = split["train"]
+
+        for item in dataset:
+            format_dataset["text"].append(item["Example_A"])
+            format_dataset["label"].append(item["Label"])
+
+    else:
+        raise ValueError(f"Unsupported dataset name: {args.dataset_name}. Please check the dataset name.")
+
+    dataset = Dataset.from_dict(format_dataset)
+    return dataset
+
+
+def preprocess_dataset(dataset, tokenizer, args):
+    filtered_data = dataset.filter(lambda x: x["label"] != 1)
+
+    def tokenize_function(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=args.seq_length,
+            padding=False,
+            return_overflowing_tokens=False,
+        )
+
+    tokenized_dataset = filtered_data.map(
+        tokenize_function,
+        batched=True,
+        num_proc=args.num_workers,
+        remove_columns=["text", "label"]
+    )
+
+    tokenized_dataset.set_format("torch")
+    return tokenized_dataset
+
+
+def run_training(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    train_dataset = get_dataset(args)
+    tokenized_dataset = preprocess_dataset(train_dataset, tokenizer, args)
+
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+    train_dataloader = DataLoader(
+        tokenized_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=data_collator,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        load_in_8bit=False,
+        device_map="cuda:0",
+        torch_dtype=torch.float16 if args.fp16 else torch.float32,
+    )
+
+    model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.00,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    )
+    model = get_peft_model(model, lora_config)
+    model.config.use_cache = False
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+
+    num_update_steps_per_epoch = len(train_dataloader)
+    max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=args.num_warmup_steps,
+        num_training_steps=max_train_steps,
+    )
+
+    monitor_log_dir = os.path.join(args.ckpts_dir, GRADIENT_MONITOR_DIRNAME)
+    tracker = LoRAGradientMonitor(model, args.model_name, monitor_log_dir)
+    tracker.reset_epoch_stats()
+
+    device = torch.device("cuda:0")
+    model.train()
+
+    for epoch in range(args.num_train_epochs):
+        tracker.save_epoch_start_params()
+
+        for step, batch in enumerate(train_dataloader):
+            optimizer.zero_grad(set_to_none=True)
+
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            loss.backward()
+
+            optimizer.step()
+            lr_scheduler.step()
+
+        tracker.end_epoch(epoch + 1)
+
+    update_history = tracker.update_stats_history
+    return update_history, tracker, model
+
+
+def main(args):
+    model_dir_name = args.model_name.split("/")[-1]
+    if args.dataset_name != "mimir":
+        exp_dir = os.path.join(
+            args.ckpts_dir,
+            model_dir_name,
+            "seed_" + str(args.seed),
+            args.dataset_name,
+        )
+    else:
+        exp_dir = os.path.join(
+            args.ckpts_dir,
+            model_dir_name,
+            "seed_" + str(args.seed),
+            args.dataset_name,
+            args.subset
+        )
+    os.makedirs(exp_dir, exist_ok=True)
+
+    update_history, tracker, model = run_training(args)
+
+    stats_history_path = os.path.join(exp_dir, ALL_EPOCHS_GRAD_STATS_FILENAME)
+    with open(stats_history_path, 'w', encoding='utf-8') as f:
+        json.dump(update_history, f, indent=4, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser("Supervised Fintuning with PEFT (Manual Training)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset_name", type=str, default="WikiMIA")
+    parser.add_argument("--subset", type=str, default="arxiv")
+    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--ckpts_dir", type=str, default=CHECKPOINTS_DIR)
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=MODEL_PATH,
+    )
+
+    parser.add_argument("--seq_length", type=int, default=512)
+    parser.add_argument("--num_train_epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=4)
+
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
+    parser.add_argument("--num_warmup_steps", type=int, default=100)
+    parser.add_argument("--weight_decay", type=float, default=0.0005)
+
+    parser.add_argument("--fp16", action="store_true", default=True)
+    parser.add_argument("--bf16", action="store_true", default=False)
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--log_freq", default=1, type=int)
+    parser.add_argument("--run_name", type=str, default="finetune")
+    parser.add_argument("--train_size", type=float, default=1)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    logging.set_verbosity_info()
+
+    main(args)
